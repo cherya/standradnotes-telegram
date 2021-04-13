@@ -56,6 +56,10 @@ func (sn *StandardNotes) Login(email, password string) error {
 	return nil
 }
 
+func (sn *StandardNotes) Logout() error {
+	return sn.client.Logout()
+}
+
 func (sn *StandardNotes) Sync() error {
 	items := libsf.NewSyncItems()
 	items.ContentType = libsf.ContentTypeItemsKey
@@ -113,8 +117,6 @@ func (sn *StandardNotes) AddNote(title, text string, tags []string) (string, err
 	if err != nil {
 		return "", errors.Wrap(err, "sn.AddNote: can't sync new note")
 	}
-
-	sn.client.Logout()
 
 	return item.ID, nil
 }

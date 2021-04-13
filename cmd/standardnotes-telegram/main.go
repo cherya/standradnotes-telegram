@@ -2,17 +2,17 @@ package main
 
 import (
 	"fmt"
+	"github.com/cherya/standardnotes-telegram/internal/app/bot"
+	md_convertor "github.com/cherya/standardnotes-telegram/internal/app/md-convertor"
 	"github.com/cherya/standardnotes-telegram/internal/pkg/sn"
-	"io"
+	"github.com/pkg/errors"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"unicode/utf16"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 	"github.com/joho/godotenv"
-	"golang.org/x/net/html"
 	"mvdan.cc/xurls/v2"
 )
 
@@ -36,60 +36,70 @@ func main() {
 		log.Fatal(err)
 	}
 
-	bot, err := tgbotapi.NewBotAPI(botToken)
+	a := app{
+		sn:       snn,
+		email:    email,
+		password: password,
+	}
+
+	b, err := bot.New(botToken, []int{ownerID}, a.handleBotMessage)
 	if err != nil {
 		log.Fatal(err)
 	}
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 20
-	updates, err := bot.GetUpdatesChan(u)
 
-	for update := range updates {
-		if update.Message == nil { // ignore any non-Message Updates
-			continue
-		}
-		if ownerID != 0 && update.Message.From.ID != ownerID {
-			continue
-		}
-
-		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
-
-		err = snn.Login(email, password)
-		if err != nil {
-			log.Println(err)
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, err.Error())
-			bot.Send(msg)
-		}
-		err = snn.Sync()
-		if err != nil {
-			log.Println(err)
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, err.Error())
-			bot.Send(msg)
-		}
-
-		messageText := getMessageText(update.Message)
-		messageLinks := getMessageLinks(update.Message)
-		messageTitle := getMessageTitle(update.Message, messageLinks)
-		messageTags := getMessageTags(update.Message, messageLinks)
-
-		_, err = snn.AddNote(messageTitle, messageText, messageTags)
-		if err != nil {
-			log.Println(err)
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, err.Error())
-			bot.Send(msg)
-		}
-
-		tgTags := strings.Builder{}
-		for _, t  := range messageTags {
-			tgTags.WriteString(fmt.Sprintf("#%s ", t))
-		}
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Note «<b>%s</b>» created \nTags: %s", messageTitle, tgTags.String()))
-		msg.ParseMode = tgbotapi.ModeHTML
-		_, err = bot.Send(msg)
-		if err != nil {
-			log.Println(err)
-		}
+	err = b.Start()
+	if err != nil {
+		log.Fatal(err)
 	}
+}
+
+type app struct {
+	sn       *sn.StandardNotes
+	email    string
+	password string
+}
+
+func (a *app) handleBotMessage(m *tgbotapi.Message) (string, error) {
+	err := a.sn.Login(a.email, a.password)
+	if err != nil {
+		return "", err
+	}
+	err = a.sn.Sync()
+	if err != nil {
+		return "", err
+	}
+
+	messageText := getMessageText(m)
+	messageLinks := getMessageLinks(m)
+	messageTitle := getMessageTitle(m)
+	messageTags := getMessageTags(m)
+
+	if len(messageLinks) > 0 {
+		messageTags = append(messageTags, "links")
+	}
+	if len(messageLinks) == 1 {
+		var meta md_convertor.PageMeta
+		messageText, meta, err = md_convertor.MdFromUrl(messageLinks[0])
+		if err != nil {
+			return "", errors.Wrap(err, "handleBotMessage: error getting url content")
+		}
+		messageTitle = meta.Title
+		messageText = fmt.Sprintf("Original: %s  \n  \n%s", messageLinks[0], messageText)
+	}
+
+	_, err = a.sn.AddNote(messageTitle, messageText, messageTags)
+	if err != nil {
+		return "", err
+	}
+
+	a.sn.Logout()
+
+	tgTags := strings.Builder{}
+	for _, t := range messageTags {
+		tgTags.WriteString(fmt.Sprintf("#%s ", t))
+	}
+
+	return fmt.Sprintf("Note *«%s»* created \nTags: %s", messageTitle, tgTags.String()), nil
 }
 
 func getMessageText(msg *tgbotapi.Message) string {
@@ -100,26 +110,15 @@ func getMessageText(msg *tgbotapi.Message) string {
 	return text
 }
 
-func getMessageTitle(msg *tgbotapi.Message, urls []string) string {
+func getMessageTitle(msg *tgbotapi.Message) string {
 	title := ""
 	if msg.ForwardFromChat != nil {
-		title = msg.ForwardFromChat.Title
-	}
-	if len(urls) > 0 {
-		resp, err := http.Get(urls[0])
-		if err != nil {
-			log.Println(err)
-			return title
-		}
-		meta := extractHTMLMeta(resp.Body)
-		if meta.Title != "" {
-			return meta.Title
-		}
+		title = fmt.Sprintf("%s #%d", msg.ForwardFromChat.Title, msg.ForwardFromMessageID)
 	}
 	return title
 }
 
-func getMessageTags(msg *tgbotapi.Message, urls []string) []string {
+func getMessageTags(msg *tgbotapi.Message) []string {
 	tags := []string{"telegram", "inbox"}
 	msgText := getMessageText(msg)
 	if msg.Entities != nil {
@@ -133,9 +132,6 @@ func getMessageTags(msg *tgbotapi.Message, urls []string) []string {
 		}
 	}
 
-	if len(urls) > 0 {
-		tags = append(tags, "links")
-	}
 	return tags
 }
 
@@ -157,82 +153,4 @@ func getMessageLinks(msg *tgbotapi.Message) []string {
 	}
 
 	return links
-}
-
-type HTMLMeta struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Image       string `json:"image"`
-	SiteName    string `json:"site_name"`
-}
-
-func extractHTMLMeta(resp io.Reader) *HTMLMeta {
-	z := html.NewTokenizer(resp)
-
-	titleFound := false
-
-	hm := new(HTMLMeta)
-
-	for {
-		tt := z.Next()
-		switch tt {
-		case html.ErrorToken:
-			return hm
-		case html.StartTagToken, html.SelfClosingTagToken:
-			t := z.Token()
-			if t.Data == `body` {
-				return hm
-			}
-			if t.Data == "title" {
-				titleFound = true
-			}
-			if t.Data == "meta" {
-				desc, ok := extractMetaProperty(t, "description")
-				if ok {
-					hm.Description = desc
-				}
-
-				ogTitle, ok := extractMetaProperty(t, "og:title")
-				if ok {
-					hm.Title = ogTitle
-				}
-
-				ogDesc, ok := extractMetaProperty(t, "og:description")
-				if ok {
-					hm.Description = ogDesc
-				}
-
-				ogImage, ok := extractMetaProperty(t, "og:image")
-				if ok {
-					hm.Image = ogImage
-				}
-
-				ogSiteName, ok := extractMetaProperty(t, "og:site_name")
-				if ok {
-					hm.SiteName = ogSiteName
-				}
-			}
-		case html.TextToken:
-			if titleFound {
-				t := z.Token()
-				hm.Title = t.Data
-				titleFound = false
-			}
-		}
-	}
-	return hm
-}
-
-func extractMetaProperty(t html.Token, prop string) (content string, ok bool) {
-	for _, attr := range t.Attr {
-		if attr.Key == "property" && attr.Val == prop {
-			ok = true
-		}
-
-		if attr.Key == "content" {
-			content = attr.Val
-		}
-	}
-
-	return
 }
